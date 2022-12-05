@@ -1,7 +1,11 @@
+import {createHash} from 'crypto';
 import {CloudWatchLogsClient} from '@aws-sdk/client-cloudwatch-logs';
 import {IAMClient} from '@aws-sdk/client-iam';
 import {LambdaClient} from '@aws-sdk/client-lambda';
 import {S3Client} from '@aws-sdk/client-s3';
+import {STSClient} from '@aws-sdk/client-sts';
+import type {AwsCredentialIdentity, AwsCredentialIdentityProvider} from '@aws-sdk/types';
+import {fromIni} from '@aws-sdk/credential-providers';
 import {ServiceQuotasClient} from '@aws-sdk/client-service-quotas';
 import type {AwsRegion} from '../pricing/aws-regions';
 import {checkCredentials} from './check-credentials';
@@ -14,15 +18,20 @@ const _clients: Partial<
 		| LambdaClient
 		| S3Client
 		| IAMClient
+		| STSClient
 		| ServiceQuotasClient
 	>
 > = {};
 
-type CredentialPair = {accessKeyId: string; secretAccessKey: string};
-
-const getCredentials = (): CredentialPair | undefined => {
+const getCredentials = (): AwsCredentialIdentity | AwsCredentialIdentityProvider | undefined => {
 	if (isInsideLambda()) {
 		return undefined;
+	}
+
+	if (process.env.REMOTION_AWS_PROFILE) {
+		return fromIni({
+			profile: process.env.REMOTION_AWS_PROFILE,
+		});
 	}
 
 	if (
@@ -45,31 +54,34 @@ const getCredentials = (): CredentialPair | undefined => {
 	return undefined;
 };
 
-const getKey = ({
-	credentials,
+const getCredentialsHash = ({
 	customCredentials,
 	region,
 	service,
 }: {
-	credentials: CredentialPair | null;
 	region: AwsRegion;
 	customCredentials: CustomCredentials | null;
 	service: keyof ServiceMapping;
 }) =>
-	[
-		credentials?.accessKeyId,
-		credentials?.secretAccessKey,
-		customCredentials?.accessKeyId,
-		customCredentials?.endpoint,
-		customCredentials?.secretAccessKey,
-		region,
-		service,
-	].join('-');
+	createHash('sha256')
+		.update(JSON.stringify({
+			credentials: {
+				...((!process.env.REMOTION_AWS_PROFILE) ? {} : {
+					awsProfile: process.env.REMOTION_AWS_PROFILE,
+				}),
+				...((process.env.REMOTION_AWS_PROFILE) ? {} : getCredentials() ?? {}),
+			},
+			customCredentials,
+			region,
+			service,
+		}))
+		.digest('base64');
 
 export type ServiceMapping = {
 	s3: S3Client;
 	cloudwatch: CloudWatchLogsClient;
 	iam: IAMClient;
+	sts: STSClient;
 	lambda: LambdaClient;
 	servicequotas: ServiceQuotasClient;
 };
@@ -109,6 +121,10 @@ export const getServiceClient = <T extends keyof ServiceMapping>({
 			return IAMClient;
 		}
 
+		if (service === 'sts') {
+			return STSClient;
+		}
+
 		if (service === 'servicequotas') {
 			return ServiceQuotasClient;
 		}
@@ -116,8 +132,7 @@ export const getServiceClient = <T extends keyof ServiceMapping>({
 		throw new TypeError('unknown client ' + service);
 	})();
 
-	const key = getKey({
-		credentials: getCredentials() ?? null,
+	const key = getCredentialsHash({
 		region,
 		customCredentials,
 		service,
@@ -176,6 +191,10 @@ export const getLambdaClient = (region: AwsRegion): LambdaClient => {
 
 export const getIamClient = (region: AwsRegion): IAMClient => {
 	return getServiceClient({region, service: 'iam', customCredentials: null});
+};
+
+export const getStsClient = (region: AwsRegion): STSClient => {
+	return getServiceClient({region, service: 'sts', customCredentials: null});
 };
 
 export const getServiceQuotasClient = (
